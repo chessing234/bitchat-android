@@ -16,6 +16,7 @@ import com.bitchat.android.mesh.MeshService
 import com.bitchat.android.mesh.PrivateMediaPreparation
 import com.bitchat.android.mesh.TransferProgressManager
 import com.bitchat.android.model.BitchatFilePacket
+import com.bitchat.android.model.BitchatMessage
 import com.bitchat.android.model.RoutedPacket
 import com.bitchat.android.noise.NoiseSession
 import com.bitchat.android.protocol.BitchatPacket
@@ -31,6 +32,7 @@ import kotlinx.coroutines.async
 import kotlinx.coroutines.coroutineScope
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.first
+import kotlinx.coroutines.flow.mapNotNull
 import kotlinx.coroutines.withContext
 import kotlinx.coroutines.withTimeout
 import kotlinx.coroutines.withTimeoutOrNull
@@ -38,6 +40,7 @@ import org.json.JSONArray
 import org.json.JSONObject
 import java.io.File
 import java.security.MessageDigest
+import java.util.Date
 
 /**
  * Headless engine behind [TestHookReceiver]. Drives the public [MeshService] API and
@@ -91,6 +94,7 @@ object TestHookDriver {
             "raw_send" -> rawSend(context, intent)
             "ble" -> setBle(intent.getBooleanExtra("enabled", true))
             "inject_peers" -> injectPeers(intent.getStringExtra("peers"))
+            "inject_synthetic_peer" -> injectSyntheticPeer(context, intent)
             "state" -> state(context)
             "clear_results" -> clearResults(context)
             else -> err(cmd, "unknown command: $cmd")
@@ -170,6 +174,94 @@ object TestHookDriver {
         return ok("inject_peers").put("peers", JSONArray(peers))
     }
 
+    /**
+     * Debug-only synthetic peer for single-device UI testing: nickname, optional mesh timeline
+     * message, and optional private conversation thread (see issue #856).
+     *
+     * Extras: [name] (required unless clearing), [peer] (optional id), [mesh_message],
+     * [private_message]. Pass an empty [name] or set extra [clear]=true to remove the synthetic
+     * peer and its injected messages.
+     */
+    private fun injectSyntheticPeer(context: Context, intent: Intent): JSONObject {
+        val defaultPeerId = "debug-synthetic-peer"
+        val peerID = intent.getStringExtra("peer")?.trim().orEmpty().ifBlank { defaultPeerId }
+        val clearing = intent.getBooleanExtra("clear", false) ||
+            intent.getStringExtra("name")?.trim()?.isEmpty() == true
+
+        if (clearing) {
+            val remaining = AppStateStore.peers.value.filter { it != peerID }
+            AppStateStore.setPeers(remaining)
+            val mesh = mesh(context)
+            return ok("inject_synthetic_peer")
+                .put("cleared", true)
+                .put("peer", peerID)
+                .put("peers", JSONArray(remaining))
+                .put("nickname", mesh.getPeerNicknames()[peerID])
+        }
+
+        val name = intent.getStringExtra("name")?.trim().orEmpty()
+        if (name.isEmpty()) {
+            return err("inject_synthetic_peer", "missing required extra: name")
+        }
+
+        val mesh = mesh(context)
+        val (noiseKey, signingKey) = syntheticPeerKeys(peerID)
+        mesh.updatePeerInfo(
+            peerID = peerID,
+            nickname = name,
+            noisePublicKey = noiseKey,
+            signingPublicKey = signingKey,
+            isVerified = true
+        )
+
+        val peers = (AppStateStore.peers.value + peerID).distinct()
+        AppStateStore.setPeers(peers)
+
+        val meshMessage = intent.getStringExtra("mesh_message")?.trim().orEmpty()
+        if (meshMessage.isNotEmpty()) {
+            val msgId = "testhook-synthetic-mesh-$peerID"
+            AppStateStore.addPublicMessage(
+                BitchatMessage(
+                    id = msgId,
+                    sender = name,
+                    content = meshMessage,
+                    timestamp = Date(),
+                    senderPeerID = peerID,
+                )
+            )
+        }
+
+        val privateMessage = intent.getStringExtra("private_message")?.trim().orEmpty()
+        if (privateMessage.isNotEmpty()) {
+            val msgId = "testhook-synthetic-dm-$peerID"
+            AppStateStore.addPrivateMessage(
+                peerID,
+                BitchatMessage(
+                    id = msgId,
+                    sender = name,
+                    content = privateMessage,
+                    timestamp = Date(),
+                    senderPeerID = peerID,
+                ),
+                forceRead = false
+            )
+        }
+
+        return ok("inject_synthetic_peer")
+            .put("peer", peerID)
+            .put("name", name)
+            .put("peers", JSONArray(peers))
+            .put("mesh_message", meshMessage.ifEmpty { JSONObject.NULL })
+            .put("private_message", privateMessage.ifEmpty { JSONObject.NULL })
+    }
+
+    private fun syntheticPeerKeys(peerID: String): Pair<ByteArray, ByteArray> {
+        val seed = MessageDigest.getInstance("SHA-256").digest("testhook-synthetic:$peerID".toByteArray())
+        val noiseKey = seed.copyOfRange(0, 32)
+        val signingKey = MessageDigest.getInstance("SHA-256").digest(noiseKey)
+        return noiseKey to signingKey
+    }
+
     private suspend fun connect(peerID: String, intent: Intent): JSONObject {
         val timeoutMs = intent.getLongExtra("timeout_ms", DEFAULT_CONNECT_TIMEOUT_MS)
         val ble = MeshServiceHolder.meshService ?: return err("connect", "BLE service not running")
@@ -247,24 +339,17 @@ object TestHookDriver {
         val timeoutMs = intent.getLongExtra("timeout_ms", DEFAULT_RECV_TIMEOUT_MS)
         val fromPeer = intent.getStringExtra("peer")
         val contains = intent.getStringExtra("contains")
-        val startTime = System.currentTimeMillis()
         val mesh = mesh(context)
-        val match = withTimeoutOrNull(timeoutMs) {
-            AppStateStore.privateMessages.first { conversations ->
-                conversations.values.flatten().any { msg ->
-                    msg.timestamp.time >= startTime &&
-                        msg.senderPeerID != mesh.myPeerID &&
-                        (fromPeer == null || msg.senderPeerID == fromPeer) &&
-                        (contains == null || msg.content.contains(contains))
-                }
-            }
-        } ?: return err("dm_recv", "timeout after ${timeoutMs}ms")
-        val msg = match.values.flatten().first { msg ->
-            msg.timestamp.time >= startTime &&
-                msg.senderPeerID != mesh.myPeerID &&
+        val matcher = ArrivedMessageMatcher(AppStateStore.privateMessages.value.values.flatten()) { msg ->
+            msg.senderPeerID != mesh.myPeerID &&
                 (fromPeer == null || msg.senderPeerID == fromPeer) &&
                 (contains == null || msg.content.contains(contains))
         }
+        val msg = withTimeoutOrNull(timeoutMs) {
+            AppStateStore.privateMessages
+                .mapNotNull { conversations -> matcher.firstArrived(conversations.values.flatten()) }
+                .first()
+        } ?: return err("dm_recv", "timeout after ${timeoutMs}ms")
         return ok("dm_recv")
             .put("from", msg.senderPeerID)
             .put("sender", msg.sender)
@@ -276,20 +361,19 @@ object TestHookDriver {
         val timeoutMs = intent.getLongExtra("timeout_ms", DEFAULT_RECV_TIMEOUT_MS)
         val contains = intent.getStringExtra("contains")
         val channel = intent.getStringExtra("channel")
-        val startTime = System.currentTimeMillis()
         val mesh = mesh(context)
-        val matches: (com.bitchat.android.model.BitchatMessage) -> Boolean = { msg ->
-            msg.timestamp.time >= startTime &&
-                msg.senderPeerID != mesh.myPeerID &&
+        val accepts: (com.bitchat.android.model.BitchatMessage) -> Boolean = { msg ->
+            msg.senderPeerID != mesh.myPeerID &&
                 (contains == null || msg.content.contains(contains)) &&
                 (channel == null || msg.channel == channel)
         }
         val found = withTimeoutOrNull(timeoutMs) {
             if (channel != null) {
-                AppStateStore.channelMessages.first { m -> m.values.flatten().any(matches) }
-                    .values.flatten().first(matches)
+                val matcher = ArrivedMessageMatcher(AppStateStore.channelMessages.value.values.flatten(), accepts)
+                AppStateStore.channelMessages.mapNotNull { m -> matcher.firstArrived(m.values.flatten()) }.first()
             } else {
-                AppStateStore.publicMessages.first { l -> l.any(matches) }.first(matches)
+                val matcher = ArrivedMessageMatcher(AppStateStore.publicMessages.value, accepts)
+                AppStateStore.publicMessages.mapNotNull(matcher::firstArrived).first()
             }
         } ?: return err("msg_recv", "timeout after ${timeoutMs}ms")
         return ok("msg_recv")
