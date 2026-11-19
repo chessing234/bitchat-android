@@ -17,7 +17,7 @@ import java.util.concurrent.ConcurrentHashMap
  * - Same reassembly logic and timeout handling
  * - Uses new FragmentPayload model for type safety
  */
-class FragmentManager {
+class FragmentManager(private val nowMillis: () -> Long = System::currentTimeMillis) {
     
     companion object {
         private const val TAG = "FragmentManager"
@@ -36,6 +36,7 @@ class FragmentManager {
 
     private val fragmentStateLock = Any()
     private var globalBufferedBytes: Long = 0L
+    private var globalBufferedEntries: Int = 0
 
     // Delegate for callbacks
     var delegate: FragmentManagerDelegate? = null
@@ -224,7 +225,7 @@ class FragmentManager {
                     fragmentMetadata[fragmentIDString] = Triple(
                         fragmentPayload.originalType,
                         fragmentPayload.total,
-                        System.currentTimeMillis()
+                        nowMillis()
                     )
                     fragmentCumulativeSize[fragmentIDString] = 0
                 }
@@ -280,9 +281,21 @@ class FragmentManager {
                     return null
                 }
 
+                val maxGlobalEntries = com.bitchat.android.util.AppConstants.Fragmentation.MAX_GLOBAL_FRAGMENT_ENTRIES
+                if (heldEntry == null && globalBufferedEntries >= maxGlobalEntries) {
+                    Log.w(TAG, "Rejecting fragment for $fragmentIDString: global buffered entries exceed cap $maxGlobalEntries")
+                    if (isNewSet) {
+                        removeFragmentSetLocked(fragmentIDString)
+                    }
+                    return null
+                }
+
                 fragmentMap[fragmentPayload.index] = fragmentPayload.data
                 fragmentCumulativeSize[fragmentIDString] = newSize
                 globalBufferedBytes += delta
+                if (heldEntry == null) {
+                    globalBufferedEntries += 1
+                }
 
                 val expectedTotal = fragmentMetadata[fragmentIDString]?.second ?: fragmentPayload.total
                 if (fragmentMap.size == expectedTotal) {
@@ -315,7 +328,8 @@ class FragmentManager {
     }
 
     private fun removeFragmentSetLocked(fragmentIDString: String) {
-        incomingFragments.remove(fragmentIDString)
+        val entries = incomingFragments.remove(fragmentIDString)?.size ?: 0
+        globalBufferedEntries -= entries
         fragmentMetadata.remove(fragmentIDString)
         val bytes = fragmentCumulativeSize.remove(fragmentIDString)?.toLong() ?: 0L
         if (bytes != 0L) {
@@ -341,9 +355,9 @@ class FragmentManager {
      * iOS cleanup - exactly matching performCleanup() implementation
      * Clean old fragments (> 30 seconds old)
      */
-    private fun cleanupOldFragments() {
+    internal fun cleanupOldFragments() {
         synchronized(fragmentStateLock) {
-            val now = System.currentTimeMillis()
+            val now = nowMillis()
             val cutoff = now - FRAGMENT_TIMEOUT
 
             // iOS: let oldFragments = fragmentMetadata.filter { $0.value.timestamp < cutoff }.map { $0.key }
@@ -366,11 +380,12 @@ class FragmentManager {
                 appendLine("Fragment Size Threshold: $FRAGMENT_SIZE_THRESHOLD bytes")
                 appendLine("Max Fragment Size: $MAX_FRAGMENT_SIZE bytes")
                 appendLine("Global Buffered Bytes: $globalBufferedBytes")
+                appendLine("Global Buffered Entries: $globalBufferedEntries")
 
                 fragmentMetadata.forEach { (fragmentID, metadata) ->
                     val (originalType, totalFragments, timestamp) = metadata
                     val received = incomingFragments[fragmentID]?.size ?: 0
-                    val ageSeconds = (System.currentTimeMillis() - timestamp) / 1000
+                    val ageSeconds = (nowMillis() - timestamp) / 1000
                     val bytes = fragmentCumulativeSize[fragmentID] ?: 0
                     appendLine("  - $fragmentID: $received/$totalFragments fragments, bytes=$bytes, type: $originalType, age: ${ageSeconds}s")
                 }
@@ -399,6 +414,7 @@ class FragmentManager {
             fragmentMetadata.clear()
             fragmentCumulativeSize.clear()
             globalBufferedBytes = 0L
+            globalBufferedEntries = 0
         }
     }
     

@@ -1,8 +1,13 @@
 package com.bitchat.android.mesh
 
+import com.bitchat.android.protocol.BinaryProtocol
 import com.bitchat.android.protocol.BitchatPacket
 import com.bitchat.android.protocol.MessageType
+import com.bitchat.android.model.BitchatFilePacket
 import com.bitchat.android.model.FragmentPayload
+import com.bitchat.android.util.AppConstants.Fragmentation
+import org.junit.After
+import org.junit.Assert.assertArrayEquals
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertNotNull
 import org.junit.Assert.assertNull
@@ -12,19 +17,25 @@ import org.junit.Before
 import org.junit.Test
 import org.junit.runner.RunWith
 import org.robolectric.RobolectricTestRunner
-import org.robolectric.shadows.ShadowLog
 import java.util.Random
 
 @RunWith(RobolectricTestRunner::class)
 class FragmentManagerTest {
 
     private lateinit var fragmentManager: FragmentManager
+    @Volatile
+    private var nowMillis = 1_000L
     private val senderID = "1122334455667788"
     private val recipientID = "8877665544332211"
 
     @Before
     fun setup() {
-        fragmentManager = FragmentManager()
+        fragmentManager = FragmentManager { nowMillis }
+    }
+
+    @After
+    fun tearDown() {
+        fragmentManager.shutdown()
     }
 
     @Test
@@ -184,11 +195,11 @@ class FragmentManagerTest {
     }
 
     @Test
-    fun `inbound fragment set above 256 is rejected`() {
+    fun `inbound fragment set above the receive count limit is rejected`() {
         val payload = FragmentPayload(
             fragmentID = ByteArray(8) { 1 },
             index = 0,
-            total = 257,
+            total = 10_001,
             originalType = MessageType.NOISE_ENCRYPTED.value,
             data = byteArrayOf(1)
         ).encode()
@@ -203,6 +214,8 @@ class FragmentManagerTest {
         )
 
         assertNull(fragmentManager.handleFragment(packet))
+        assertBufferedEntries(0)
+        assertTrue(fragmentManager.getDebugInfo().contains("Active Fragment Sets: 0"))
     }
 
     @Test
@@ -300,6 +313,7 @@ class FragmentManagerTest {
         fragments.dropLast(1).forEach {
             assertNull("No fragment before the last should complete", fragmentManager.handleFragment(it))
         }
+        assertBufferedEntries(fragments.size - 1)
     }
 
     private fun assertCompletes(original: BitchatPacket, last: BitchatPacket) {
@@ -309,6 +323,7 @@ class FragmentManagerTest {
             "Reassembled payload must be the honest bytes",
             original.payload.contentEquals(reassembled!!.payload)
         )
+        assertBufferedEntries(0)
     }
 
     @Test
@@ -375,37 +390,189 @@ class FragmentManagerTest {
     }
 
     @Test
-    fun `a file above the private-media fragment cap still reassembles`() {
-        fun fragment(total: Int): BitchatPacket {
-            return BitchatPacket(
-                version = 1u,
-                type = MessageType.FRAGMENT.value,
-                senderID = hexStringToByteArray(senderID),
-                recipientID = hexStringToByteArray(recipientID),
-                timestamp = 1u,
-                payload = FragmentPayload(
-                    fragmentID = ByteArray(8) { total.toByte() },
-                    index = 0,
-                    total = total,
-                    originalType = MessageType.FILE_TRANSFER.value,
-                    data = byteArrayOf(1)
-                ).encode(),
-                ttl = 7u
-            )
-        }
+    fun `tiny fragments cannot exceed the shared entry budget`() {
+        fillEntryBudget()
+        val fullState = fragmentManager.getDebugInfo()
 
-        ShadowLog.clear()
-        assertNull(fragmentManager.handleFragment(fragment(257)))
-        assertTrue(
-            ShadowLog.getLogs().none { it.msg.contains("excessive total count") }
-        )
+        // Identical and conflicting duplicates neither charge nor replace entries.
+        assertNull(fragmentManager.handleFragment(incompleteFragment(1, 0)))
+        assertNull(fragmentManager.handleFragment(incompleteFragment(1, 0, byteArrayOf(2))))
+        // Reject a new index without destroying the existing set, and remove an
+        // empty set created by a rejected first fragment.
+        assertNull(fragmentManager.handleFragment(incompleteFragment(2, 6_385)))
+        assertNull(fragmentManager.handleFragment(incompleteFragment(3, 0)))
 
-        ShadowLog.clear()
-        assertNull(fragmentManager.handleFragment(fragment(10_001)))
-        assertTrue(
-            ShadowLog.getLogs().any { it.msg.contains("excessive total count") }
-        )
+        assertEquals(fullState, fragmentManager.getDebugInfo())
+        assertBufferedEntries(16_384)
     }
+
+    @Test
+    fun `timeout releases entry credits exactly once`() {
+        fillEntryBudget()
+        nowMillis += Fragmentation.FRAGMENT_TIMEOUT_MS
+        fragmentManager.cleanupOldFragments()
+        assertBufferedEntries(16_384)
+
+        nowMillis += 1
+        fragmentManager.cleanupOldFragments()
+        assertBufferedEntries(0)
+        assertTrue(fragmentManager.getDebugInfo().contains("Global Buffered Bytes: 0"))
+        assertTrue(fragmentManager.getDebugInfo().contains("Active Fragment Sets: 0"))
+        fragmentManager.cleanupOldFragments()
+        assertBufferedEntries(0)
+        fillEntryBudget()
+    }
+
+    @Test
+    fun `reset and shutdown release entry credits`() {
+        fillEntryBudget()
+        fragmentManager.clearAllFragments()
+        assertBufferedEntries(0)
+        fillEntryBudget()
+        fragmentManager.shutdown()
+        assertBufferedEntries(0)
+        assertTrue(fragmentManager.getDebugInfo().contains("Global Buffered Bytes: 0"))
+        assertTrue(fragmentManager.getDebugInfo().contains("Active Fragment Sets: 0"))
+    }
+
+    @Test
+    fun `active set rejection does not consume entry credits`() {
+        repeat(64) { set ->
+            assertNull(fragmentManager.handleFragment(incompleteFragment(set + 1, 0)))
+        }
+        val fullState = fragmentManager.getDebugInfo()
+        assertNull(fragmentManager.handleFragment(incompleteFragment(65, 0)))
+        assertEquals(fullState, fragmentManager.getDebugInfo())
+        assertBufferedEntries(64)
+    }
+
+    @Test
+    fun `byte admission failures do not consume entry credits`() {
+        assertNull(fragmentManager.handleFragment(incompleteFragment(
+            1, 0, ByteArray(Fragmentation.MAX_FRAGMENT_TOTAL_BYTES + 1)
+        )))
+        assertBufferedEntries(0)
+        assertTrue(fragmentManager.getDebugInfo().contains("Active Fragment Sets: 0"))
+
+        repeat(4) { set ->
+            assertNull(fragmentManager.handleFragment(incompleteFragment(
+                set + 1, 0, ByteArray(1_048_576)
+            )))
+        }
+        val fullState = fragmentManager.getDebugInfo()
+        assertNull(fragmentManager.handleFragment(incompleteFragment(5, 0)))
+        assertNull(fragmentManager.handleFragment(incompleteFragment(1, 1)))
+        assertEquals(fullState, fragmentManager.getDebugInfo())
+        assertBufferedEntries(4)
+    }
+
+    @Test
+    fun `literal file frame completes across 257 fragments`() {
+        val wire = hex(
+            "022207010203040506070800000191781011121314151617" +
+                "01000161020004000191640300016d0400019164"
+        ) + ByteArray(102_756) { 0x5a }
+
+        assertGoldenFileCompletes(wire, 257, 102_756)
+    }
+
+    @Test
+    fun `literal file frame at the byte ceiling completes across 10000 fragments`() {
+        // 1,179,760 uncompressed frame bytes, above the former 1 MiB bound.
+        val wire = hex(
+            "022207010203040506070800001200581011121314151617" +
+                "01000161020004001200440300016d0400120044"
+        ) + ByteArray(1_179_716) { 0x5a }
+
+        assertEquals(1_179_760, wire.size)
+        assertGoldenFileCompletes(wire, 10_000, 1_179_716)
+    }
+
+    @Test
+    fun `literal file frame one byte above the ceiling is not reassembled`() {
+        val wire = hex(
+            "022207010203040506070800001200591011121314151617" +
+                "01000161020004001200450300016d0400120045"
+        ) + ByteArray(1_179_717) { 0x5a }
+
+        assertNotNull("The original frame itself is decodable", BinaryProtocol.decode(wire))
+        assertNull(reassembleGoldenFrame(wire, 10_000))
+        assertBufferedEntries(9_999)
+    }
+
+    private fun incompleteFragment(
+        set: Int,
+        index: Int,
+        data: ByteArray = byteArrayOf(1)
+    ): BitchatPacket = BitchatPacket(
+        version = 1u,
+        type = MessageType.FRAGMENT.value,
+        senderID = hexStringToByteArray(senderID),
+        timestamp = 1u,
+        payload = FragmentPayload(
+            fragmentID = ByteArray(8).also { it[7] = set.toByte() },
+            index = index,
+            total = 10_000,
+            originalType = MessageType.FILE_TRANSFER.value,
+            data = data
+        ).encode(),
+        ttl = 7u
+    )
+
+    private fun fillEntryBudget() {
+        // Two incomplete sets, only 16 KiB of data, not a 640k-entry allocation.
+        repeat(9_999) { assertNull(fragmentManager.handleFragment(incompleteFragment(1, it))) }
+        repeat(6_385) { assertNull(fragmentManager.handleFragment(incompleteFragment(2, it))) }
+        assertBufferedEntries(16_384)
+        assertTrue(fragmentManager.getDebugInfo().contains("Global Buffered Bytes: 16384"))
+        assertTrue(fragmentManager.getDebugInfo().contains("Active Fragment Sets: 2"))
+    }
+
+    private fun assertBufferedEntries(expected: Int) {
+        val line = fragmentManager.getDebugInfo().lineSequence()
+            .first { it.startsWith("Global Buffered Entries:") }
+        assertEquals("Global Buffered Entries: $expected", line)
+    }
+
+    private fun assertGoldenFileCompletes(wire: ByteArray, total: Int, contentSize: Int) {
+        val packet = reassembleGoldenFrame(wire, total)
+        assertNotNull("All fragments must produce the original file", packet)
+        assertEquals(0u.toUByte(), packet!!.ttl)
+        assertArrayEquals(wire, BinaryProtocol.encode(packet.copy(ttl = 7u), padding = false))
+        val file = BitchatFilePacket.decode(packet.payload)
+        assertNotNull(file)
+        assertEquals("a", file!!.fileName)
+        assertEquals("m", file.mimeType)
+        assertEquals(contentSize.toLong(), file.fileSize)
+        assertArrayEquals(ByteArray(contentSize) { 0x5a }, file.content)
+        assertBufferedEntries(0)
+        assertTrue(fragmentManager.getDebugInfo().contains("Global Buffered Bytes: 0"))
+    }
+
+    private fun reassembleGoldenFrame(wire: ByteArray, total: Int): BitchatPacket? {
+        var completed: BitchatPacket? = null
+        repeat(total) { index ->
+            // Literal, uncompressed v1 fragment envelopes and v2 file bytes:
+            // neither the fragment planner nor file encoder supplies the oracle.
+            val start = (wire.size.toLong() * index / total).toInt()
+            val end = (wire.size.toLong() * (index + 1) / total).toInt()
+            val payload = hex("0001020304050607") + u16(index) + u16(total) +
+                byteArrayOf(0x22) + wire.copyOfRange(start, end)
+            val fragmentWire = hex("012007010203040506070800") + u16(payload.size) +
+                hex("1011121314151617") + payload
+            val fragment = BinaryProtocol.decode(fragmentWire)
+            assertNotNull(fragment)
+            val result = fragmentManager.handleFragment(fragment!!)
+            if (index < total - 1) assertNull(result) else completed = result
+        }
+        return completed
+    }
+
+    private fun hex(value: String): ByteArray =
+        value.chunked(2).map { it.toInt(16).toByte() }.toByteArray()
+
+    private fun u16(value: Int): ByteArray =
+        byteArrayOf((value ushr 8).toByte(), value.toByte())
 
     @Test
     fun `an oversized fragment cannot wipe an assembly it did not start`() {

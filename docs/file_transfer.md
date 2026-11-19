@@ -181,11 +181,26 @@ File transfers reuse the mesh broadcaster’s fragmentation logic:
 - `BluetoothPacketBroadcaster` checks if the serialized envelope exceeds the configured MTU and splits it into fragments via `FragmentManager`.
 - Fragments are sent with a short inter-fragment delay (currently 20 ms).
 - When only one fragment is needed, send as a single packet.
-- Android receivers reject fragment sets declaring more than 256 fragments.
-  Private senders use that same 256-fragment limit and calculate it from the
-  exact final routed, signed, and encrypted packet before creating a local
-  echo. Generic/public outbound planning retains its prior UInt16 count range,
-  so this private-media migration does not silently change public sending.
+- Android receivers accept up to 10,000 fragments and 1,179,760 serialized
+  frame bytes per set. Reassembly also admits at most 64 active sets,
+  4 MiB of fragment data, and 16,384 retained fragment entries globally.
+  The entry budget bounds map/array objects independently of data bytes and
+  preserves the previous aggregate envelope of 64 sets times 256 entries;
+  it still permits a single complete 10,000-fragment assembly.
+- A new index consumes one entry only after all admission checks pass.
+  Identical duplicates do not consume another entry, conflicting duplicates
+  cannot replace held bytes, and rejected fragments preserve admitted data.
+  An empty newly rejected set is removed. Completion, timeout cleanup (sets
+  older than 30 seconds), reset, and shutdown release the held entry credits.
+  Concurrent sets share these budgets; the limits are resource admission
+  policy, not a guarantee that every concurrent transfer can complete.
+- Private senders retain the separate 256-fragment limit and calculate it
+  from the exact final routed, signed, and encrypted packet before creating
+  a local echo. Generic/public outbound planning retains its prior UInt16
+  count range, so this receive-side change does not change private sending.
+- `FragmentManagerTest` includes literal uncompressed file-frame vectors
+  completed through wire decoding and reassembly at 257 fragments and at
+  10,000 fragments / 1,179,760 frame bytes, plus a one-byte-over rejection.
 
 ### 2.2 Transfer ID and progress events
 

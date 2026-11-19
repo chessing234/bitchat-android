@@ -49,6 +49,10 @@ object AppConstants {
         const val MAX_FRAGMENT_TOTAL_BYTES: Int = 1_179_760
         const val MAX_ACTIVE_FRAGMENT_SETS: Int = 64
         const val MAX_GLOBAL_FRAGMENT_TOTAL_BYTES: Long = 4L * 1_048_576L
+        // Bound map entries/byte-array objects independently of payload bytes.
+        // Preserve the old aggregate envelope (64 sets * 256 entries), while
+        // allowing a single legitimate 10_000-fragment receive assembly.
+        const val MAX_GLOBAL_FRAGMENT_ENTRIES: Int = 16_384
     }
 
     object Security {
