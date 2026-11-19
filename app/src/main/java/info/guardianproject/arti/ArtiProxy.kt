@@ -32,6 +32,8 @@ class ArtiProxy private constructor(
 ) {
     companion object {
         private const val TAG = "ArtiProxy"
+        private val nativeLock = Any()
+        private val guardStateRecovery = ArtiGuardStateRecovery()
     }
 
     @Volatile
@@ -47,22 +49,22 @@ class ArtiProxy private constructor(
      *
      * @throws ArtiException if initialization or startup fails
      */
-    fun start() {
+    fun start(): Unit = synchronized(nativeLock) {
         if (isRunning) {
             Log.w(TAG, "Arti already running")
-            return
+            return@synchronized
         }
 
         try {
-            logListener?.let { listener ->
-                Log.d(TAG, "Registering log callback")
-                ArtiNative.setLogCallback(listener)
+            ArtiNative.setLogCallback { line ->
+                guardStateRecovery.onLogLine(line)
+                logListener?.onLogLine(line)
             }
 
             val dataDir = getDataDirectory()
             Log.i(TAG, "Initializing Arti with data directory: $dataDir")
 
-            val initResult = ArtiNative.initialize(dataDir.absolutePath)
+            val initResult = guardStateRecovery.initialize(application.filesDir, ArtiNative::initialize)
             if (initResult != 0) {
                 throw ArtiException("Failed to initialize Arti: error code $initResult")
             }
@@ -95,10 +97,10 @@ class ArtiProxy private constructor(
      *
      * This method gracefully shuts down the Tor client and SOCKS proxy.
      */
-    fun stop() {
+    fun stop(): Unit = synchronized(nativeLock) {
         if (!isRunning) {
             Log.w(TAG, "Arti not running")
-            return
+            return@synchronized
         }
 
         try {
