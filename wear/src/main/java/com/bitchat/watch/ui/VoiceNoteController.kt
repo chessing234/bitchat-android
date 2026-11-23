@@ -35,8 +35,14 @@ class VoiceNoteController(
 ) {
     private var recorder: VoiceRecorder? = null
 
-    /** Whether the overlay currently shows "Lift to cancel"; the 10 s cap honors the same choice. */
+    /** Whether the overlay currently shows "Lift to cancel". */
     internal var hoveringCancel = false
+
+    /**
+     * Same hit test the pointer-up path uses. The cap reads this directly so a slide that
+     * lands before the next composition frame still decides send versus cancel.
+     */
+    internal var cancelHitTest: () -> Boolean = { hoveringCancel }
 
     var recording by mutableStateOf(false)
         private set
@@ -70,7 +76,7 @@ class VoiceNoteController(
                 val elapsed = clock() - startedAt
                 elapsedMs = elapsed
                 if (elapsed >= MAX_VOICE_NOTE_MS) {
-                    val cancel = hoveringCancel
+                    val cancel = cancelHitTest()
                     if (cancel) WearHaptics.reject(context)
                     stop(send = !cancel)
                     break

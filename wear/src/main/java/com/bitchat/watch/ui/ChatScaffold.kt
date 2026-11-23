@@ -254,8 +254,12 @@ private fun ChatBody(
     var cancelBounds by remember { mutableStateOf<Rect?>(null) }
     var fingerPos by remember { mutableStateOf(Offset.Zero) }
     var fingerActive by remember { mutableStateOf(false) }
-    val hoveringCancel = fingerActive &&
-        cancelBounds?.inflate(CANCEL_HOVER_SLANT_PX)?.contains(fingerPos) == true
+    fun cancelHovered(position: Offset = fingerPos): Boolean =
+        fingerActive && cancelBounds?.inflate(CANCEL_HOVER_SLANT_PX)?.contains(position) == true
+    val hoveringCancel = cancelHovered()
+    // Pointer moves update the controller immediately. SideEffect still mirrors the
+    // composed value so the overlay and the cap share one predicate.
+    voice.cancelHitTest = { cancelHovered() }
     SideEffect { voice.hoveringCancel = hoveringCancel }
 
     // Magnetic attraction: as the finger approaches the target (but is not on it yet), the
@@ -310,10 +314,9 @@ private fun ChatBody(
                         val change = event.changes.firstOrNull() ?: continue
                         fingerPos = change.position
                         fingerActive = true
+                        voice.hoveringCancel = cancelHovered(change.position)
                         if (event.changes.any { it.changedToUp() }) {
-                            val cancel = cancelBounds
-                                ?.inflate(CANCEL_HOVER_SLANT_PX)
-                                ?.contains(change.position) == true
+                            val cancel = voice.cancelHitTest()
                             fingerActive = false
                             if (cancel) {
                                 WearHaptics.reject(context)

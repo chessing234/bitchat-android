@@ -181,6 +181,23 @@ class VoiceNotePushToTalkTest {
     }
 
     @Test
+    fun `cap uses the latest hit test before another composition frame`() = runTest {
+        val voice = virtualTimeController(this)
+        var hovering = false
+        voice.cancelHitTest = { hovering }
+
+        voice.start()
+        hovering = true
+        advanceTimeBy(MAX_VOICE_NOTE_MS + POLL_SLACK_MS)
+        runCurrent()
+
+        assertFalse(voice.recording)
+        verify(recorder).stop(true)
+        assertTrue(sent.isEmpty())
+        assertFalse(voice.hoveringCancel)
+    }
+
+    @Test
     fun `ten second cap discards the note while the finger hovers the cancel target`() = runTest {
         val voice = virtualTimeController(this)
 
