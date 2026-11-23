@@ -30,6 +30,16 @@ import java.nio.ByteBuffer
 import java.util.Date
 import java.util.UUID
 
+/**
+ * Keeps [source] when it is already the replay path. Deleting [target] first would remove the
+ * only segment of a stream that reopened without a new file.
+ */
+internal fun promoteSingleSegment(source: File, target: File): File {
+    if (source.absolutePath == target.absolutePath) return source
+    target.delete()
+    return if (source.renameTo(target)) target else source
+}
+
 /** What the UI shows for one stream that is currently live. */
 data class LiveVideoStreamInfo(
     val messageID: String,
@@ -238,9 +248,15 @@ class LiveVideoManager private constructor(private val context: Context) : LiveV
         var stream = streams[key]
         if (stream == null) {
             val closed = finished[key]
-            // A stream the sender ended stays closed; one closed by silence reopens in place.
+            // Cancellation applies to a silence-closed replay too, and a terminal record
+            // stops a late media packet from recreating the bubble.
+            if (packet.kind == VideoBurstPacket.Kind.Canceled || packet.kind is VideoBurstPacket.Kind.End) {
+                if (closed != null && packet.kind == VideoBurstPacket.Kind.Canceled) {
+                    discardFinishedReplay(closed)
+                }
+                return true
+            }
             if (closed?.endedBySender == true) return true
-            if (packet.kind is VideoBurstPacket.Kind.End || packet.kind == VideoBurstPacket.Kind.Canceled) return true
             if (streams.size >= MAX_CONCURRENT_STREAMS) return false
             stream = (if (closed != null) reopenStream(closed) else createStream(key, nickname, timestampMs)) ?: return false
             streams[key] = stream
@@ -508,8 +524,7 @@ class LiveVideoManager private constructor(private val context: Context) : LiveV
         } else {
             val target = File(stream.file.parentFile, "video_${stream.key.streamID}_${stream.key.peerID}_${if (stream.key.isPrivate) "dm" else "mesh"}.mp4")
             if (segments.size == 1) {
-                target.delete()
-                stream.file = if (segments[0].file.renameTo(target)) target else segments[0].file
+                stream.file = promoteSingleSegment(segments[0].file, target)
             } else {
                 // Sessions separated by a dropout play back as one video, the gap held as a freeze.
                 val joined = File(stream.file.parentFile, "video_join_${stream.key.streamID}.mp4")
@@ -573,10 +588,43 @@ class LiveVideoManager private constructor(private val context: Context) : LiveV
         stream.writer?.finish()
         removeBubble(stream)
         stream.file.delete()
+        rememberTerminal(stream.key, stream.nickname, stream.message.id, stream.message.timestamp, stream.startedAtMs)
         if (emit) {
             _events.tryEmit(LiveVideoEvent.Canceled(stream.key.peerID, stream.key.streamID, stream.key.isPrivate))
         }
         publishInfo(force = true)
+    }
+
+    private fun discardFinishedReplay(closed: FinishedStream) {
+        closed.file?.delete()
+        closed.segments.forEach { it.file.delete() }
+        if (closed.key.isPrivate) {
+            AppStateStore.removePrivateMessage(closed.messageID)
+        } else {
+            AppStateStore.removePublicMessage(closed.messageID)
+        }
+        rememberTerminal(closed.key, closed.nickname, closed.messageID, closed.timestamp, closed.startedAtMs)
+    }
+
+    private fun rememberTerminal(
+        key: StreamKey,
+        nickname: String,
+        messageID: String,
+        timestamp: Date,
+        startedAtMs: Long
+    ) {
+        pruneFinished()
+        finished[key] = FinishedStream(
+            key = key,
+            messageID = messageID,
+            nickname = nickname,
+            file = null,
+            timestamp = timestamp,
+            expiresAtMs = System.currentTimeMillis() + FINISHED_TTL_MS,
+            startedAtMs = startedAtMs,
+            endedBySender = true,
+            segments = emptyList()
+        )
     }
 
     private fun removeBubble(stream: Stream) {

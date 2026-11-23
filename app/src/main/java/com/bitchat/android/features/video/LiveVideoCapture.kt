@@ -133,7 +133,13 @@ class LiveVideoCapture(
     val outputWidth: Int get() = quality.width
     val outputHeight: Int get() = quality.height
 
-    fun setMuted(value: Boolean) = muted.set(value)
+    /** False when this capture was opened without an audio track. Mute cannot add one later. */
+    val capturesAudio: Boolean get() = audioEnabled
+
+    fun setMuted(value: Boolean) {
+        if (!audioEnabled) return
+        muted.set(value)
+    }
 
     fun elapsedMs(): Long = if (startNs == 0L) 0L else (System.nanoTime() - startNs) / 1_000_000L
 

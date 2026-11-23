@@ -129,6 +129,7 @@ fun VideoStudio(
     var phase by remember { mutableStateOf(StudioPhase.IDLE) }
     var quality by remember { mutableStateOf(LiveVideoQuality.LOW) }
     var micOn by remember { mutableStateOf(hasPermission(context, Manifest.permission.RECORD_AUDIO)) }
+    var captureHasAudio by remember { mutableStateOf(true) }
     var useFrontCamera by remember { mutableStateOf(false) }
     var cameraGranted by remember { mutableStateOf(hasPermission(context, Manifest.permission.CAMERA)) }
     var confirmEnd by remember { mutableStateOf(false) }
@@ -139,6 +140,7 @@ fun VideoStudio(
     val surfaceRequests = remember { MutableStateFlow<SurfaceRequest?>(null) }
     val surfaceRequest by surfaceRequests.collectAsState()
     val analysisExecutor = remember { Executors.newSingleThreadExecutor() }
+    val cameraGeneration = remember { java.util.concurrent.atomic.AtomicInteger(0) }
     val outgoingDir = remember { File(context.filesDir, "videos/outgoing").apply { mkdirs() } }
     val latestOnClose by rememberUpdatedState(onClose)
 
@@ -197,11 +199,13 @@ fun VideoStudio(
         if (phase != StudioPhase.IDLE) return
         val target = if (mode == StudioMode.LIVE) liveTarget ?: return else null
         val preset = if (mode == StudioMode.LIVE) quality else LiveVideoQuality.CLIP
+        val withAudio = micOn && hasPermission(context, Manifest.permission.RECORD_AUDIO)
+        captureHasAudio = withAudio
         val capture = LiveVideoCapture(
             outputDirectory = outgoingDir,
             target = target,
             quality = preset,
-            audioEnabled = micOn && hasPermission(context, Manifest.permission.RECORD_AUDIO)
+            audioEnabled = withAudio
         )
         phase = StudioPhase.STARTING
         scope.launch {
@@ -267,13 +271,21 @@ fun VideoStudio(
     DisposableEffect(cameraGranted, useFrontCamera, lifecycleOwner) {
         if (!cameraGranted) return@DisposableEffect onDispose { }
         val providerFuture = ProcessCameraProvider.getInstance(context)
+        val generation = cameraGeneration.incrementAndGet()
         var provider: ProcessCameraProvider? = null
+        var previewUseCase: Preview? = null
+        var analysisUseCase: ImageAnalysis? = null
         providerFuture.addListener({
+            if (generation != cameraGeneration.get()) return@addListener
             val cameraProvider = runCatching { providerFuture.get() }.getOrNull() ?: return@addListener
+            if (generation != cameraGeneration.get()) return@addListener
             provider = cameraProvider
             val preview = Preview.Builder().build().also {
-                it.setSurfaceProvider { request -> surfaceRequests.value = request }
+                it.setSurfaceProvider { request ->
+                    if (generation == cameraGeneration.get()) surfaceRequests.value = request
+                }
             }
+            previewUseCase = preview
             val analysis = ImageAnalysis.Builder()
                 .setBackpressureStrategy(ImageAnalysis.STRATEGY_KEEP_ONLY_LATEST)
                 .setResolutionSelector(
@@ -294,35 +306,31 @@ fun VideoStudio(
                         }
                     }
                 }
+            analysisUseCase = analysis
             val selector = if (useFrontCamera) CameraSelector.DEFAULT_FRONT_CAMERA else CameraSelector.DEFAULT_BACK_CAMERA
+            if (generation != cameraGeneration.get()) return@addListener
+            runCatching { cameraProvider.unbind(preview, analysis) }
             runCatching {
-                cameraProvider.unbindAll()
                 cameraProvider.bindToLifecycle(lifecycleOwner, selector, preview, analysis)
             }.onFailure { Log.w("VideoStudio", "Camera bind failed: ${it.message}") }
         }, ContextCompat.getMainExecutor(context))
         onDispose {
+            cameraGeneration.incrementAndGet()
             surfaceRequests.value = null
-            runCatching { provider?.unbindAll() }
+            val owned = listOfNotNull(previewUseCase, analysisUseCase).toTypedArray()
+            runCatching {
+                if (owned.isNotEmpty()) provider?.unbind(*owned)
+            }
         }
     }
 
     DisposableEffect(Unit) {
         onDispose {
             disposed.set(true)
-            // Leaving the screen ends whatever is running and still delivers it.
+            cameraGeneration.incrementAndGet()
+            // Dismissal discards the clip. Delivery stays on the explicit finish action or the cap.
             captureRef.getAndSet(null)?.let { capture ->
-                val wasLive = mode == StudioMode.LIVE
-                Thread {
-                    val file = capture.stop(canceled = false)
-                    if (file != null) {
-                        if (wasLive) {
-                            actions.onLiveFinished(peer, channel, file.absolutePath)
-                        } else if (file.length() <= LiveVideoLimits.MAX_VIDEO_FILE_BYTES) {
-                            val clip = File(outgoingDir, "clip_${System.currentTimeMillis()}.mp4")
-                            actions.onVideoReady(peer, channel, (if (file.renameTo(clip)) clip else file).absolutePath)
-                        }
-                    }
-                }.start()
+                Thread { capture.stop(canceled = true) }.start()
             }
             analysisExecutor.shutdown()
         }
@@ -336,7 +344,7 @@ fun VideoStudio(
         BackHandler(enabled = true) {
             when {
                 phase == StudioPhase.RUNNING && mode == StudioMode.LIVE -> confirmEnd = true
-                phase == StudioPhase.RUNNING -> finish(canceled = false)
+                phase == StudioPhase.RUNNING -> finish(canceled = true)
                 phase == StudioPhase.IDLE -> onClose()
             }
         }
@@ -435,10 +443,12 @@ fun VideoStudio(
                     liveAvailable = liveTarget != null,
                     quality = quality,
                     micOn = micOn,
+                    micEnabled = phase != StudioPhase.RUNNING || captureHasAudio,
                     startedAt = startedAt,
                     onMode = { if (phase == StudioPhase.IDLE) mode = it },
                     onQuality = { if (phase == StudioPhase.IDLE) quality = it },
-                    onMic = {
+                    onMic = mic@{
+                        if (phase == StudioPhase.RUNNING && !captureHasAudio) return@mic
                         if (!hasPermission(context, Manifest.permission.RECORD_AUDIO)) {
                             permissions.launch(arrayOf(Manifest.permission.RECORD_AUDIO))
                         } else {
@@ -549,6 +559,7 @@ private fun StudioControls(
     liveAvailable: Boolean,
     quality: LiveVideoQuality,
     micOn: Boolean,
+    micEnabled: Boolean,
     startedAt: Long,
     onMode: (StudioMode) -> Unit,
     onQuality: (LiveVideoQuality) -> Unit,
@@ -608,7 +619,7 @@ private fun StudioControls(
                 enabled = phase == StudioPhase.IDLE || phase == StudioPhase.RUNNING,
                 onClick = onShutter
             )
-            StudioRoundButton(enabled = true, onClick = onMic) {
+            StudioRoundButton(enabled = micEnabled, onClick = onMic) {
                 Icon(
                     imageVector = if (micOn) Icons.Filled.Mic else Icons.Filled.MicOff,
                     contentDescription = stringResource(if (micOn) R.string.cd_mute else R.string.cd_unmute),

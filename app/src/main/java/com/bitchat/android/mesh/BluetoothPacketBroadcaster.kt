@@ -448,16 +448,23 @@ class BluetoothPacketBroadcaster(
         val servedPeers = mutableSetOf<String>()
         // Relaying live video to a neighbor that hears the origin directly only spends airtime
         // on a duplicate, so those neighbors are pruned (mesh graph from verified announcements).
+        // If every remaining path was pruned, forward anyway: mutual announcements can outlive
+        // the direct link, and this relay may be the only route left.
         val pruneOriginNeighbors = MessageType.fromValue(packet.type) == MessageType.VIDEO_FRAME &&
             senderID != myPeerID
         fun prunable(peer: String?): Boolean = pruneOriginNeighbors && peer != null &&
             com.bitchat.android.services.meshgraph.MeshGraphService.getInstance().isConfirmedNeighbor(senderID, peer)
+        val deferredClients = mutableListOf<BluetoothConnectionTracker.DeviceConnection>()
         if (liveMedia) {
             connectedDevices.values.forEach { deviceConn ->
                 if (!deviceConn.isClient || deviceConn.gatt == null || deviceConn.characteristic == null) return@forEach
                 if (deviceConn.device.address == routed.relayAddress) return@forEach
                 val peer = connectionTracker.addressPeerMap[deviceConn.device.address]
-                if (peer == senderID || (peer != null && peer in servedPeers) || prunable(peer)) return@forEach
+                if (peer == senderID || (peer != null && peer in servedPeers)) return@forEach
+                if (prunable(peer)) {
+                    deferredClients.add(deviceConn)
+                    return@forEach
+                }
                 if (writeToDeviceConn(deviceConn, data, deadline)) {
                     accepted = true
                     peer?.let(servedPeers::add)
@@ -466,6 +473,7 @@ class BluetoothPacketBroadcaster(
         }
 
         // Send to server connections (devices connected to our GATT server)
+        val deferredServers = mutableListOf<BluetoothDevice>()
         subscribedDevices.forEach { device ->
             if (device.address == routed.relayAddress) {
                 return@forEach
@@ -475,13 +483,38 @@ class BluetoothPacketBroadcaster(
             }
             if (liveMedia) {
                 val peer = connectionTracker.addressPeerMap[device.address]
-                if (prunable(peer) || (peer != null && !servedPeers.add(peer))) return@forEach
+                if (peer != null && peer in servedPeers) return@forEach
+                if (prunable(peer)) {
+                    deferredServers.add(device)
+                    return@forEach
+                }
+                peer?.let(servedPeers::add)
             }
             val sent = notifyDevice(device, data, gattServer, characteristic, deadline)
             if (sent) {
                 accepted = true
                 val toPeer = connectionTracker.addressPeerMap[device.address]
                 logPacketRelay(typeName, senderPeerID, senderNick, incomingPeer, incomingAddr, toPeer, device.address, packet.ttl, packet.version, routeInfo)
+            }
+        }
+
+        if (!accepted) {
+            deferredClients.forEach { deviceConn ->
+                val peer = connectionTracker.addressPeerMap[deviceConn.device.address]
+                if (peer != null && peer in servedPeers) return@forEach
+                if (writeToDeviceConn(deviceConn, data, deadline)) {
+                    accepted = true
+                    peer?.let(servedPeers::add)
+                }
+            }
+            deferredServers.forEach { device ->
+                val peer = connectionTracker.addressPeerMap[device.address]
+                if (peer != null && peer in servedPeers) return@forEach
+                if (notifyDevice(device, data, gattServer, characteristic, deadline)) {
+                    accepted = true
+                    peer?.let(servedPeers::add)
+                    logPacketRelay(typeName, senderPeerID, senderNick, incomingPeer, incomingAddr, peer, device.address, packet.ttl, packet.version, routeInfo)
+                }
             }
         }
         
