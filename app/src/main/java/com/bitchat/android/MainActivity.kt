@@ -730,17 +730,23 @@ class MainActivity : OrientationAwareActivity() {
                 unifiedMeshService.startServices()
                 startMeshForegroundServiceBestEffort()
 
-                // Re-initialization after Bluetooth or location recovery must not replay an intent
-                if (mainViewModel.consumeActivityIntentPending()) {
-                    handleNotificationIntent(intent)
-                    handleVerificationIntent(intent)
-                }
-
-                // Small delay to ensure mesh service is fully initialized
+                // Small delay to ensure mesh service is fully initialized.
+                // Intents that arrive during this window still see INITIALIZING, so the pending
+                // flag is drained at the completion transition rather than before the delay.
                 delay(500)
                 Log.i("MainActivity", "App initialization complete")
                 // Bluetooth or location may have been switched off while this attempt was running.
-                if (mainViewModel.onboardingState.value == OnboardingState.INITIALIZING) {
+                val completed = OnboardingSystemEventPolicy.finishInitialization(
+                    state = mainViewModel.onboardingState.value,
+                    consumePendingIntent = mainViewModel::consumeActivityIntentPending,
+                    routePendingIntent = {
+                        handleNotificationIntent(intent)
+                        handleVerificationIntent(intent)
+                    }
+                )
+                if (completed == OnboardingState.COMPLETE &&
+                    mainViewModel.onboardingState.value == OnboardingState.INITIALIZING
+                ) {
                     mainViewModel.updateOnboardingState(OnboardingState.COMPLETE)
                 }
             } catch (e: CancellationException) {

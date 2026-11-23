@@ -37,6 +37,21 @@ internal object OnboardingSystemEventPolicy {
     fun returnsToBluetoothCheck(state: OnboardingState): Boolean = state in BLUETOOTH_REQUIRED_STATES
 
     fun returnsToLocationCheck(state: OnboardingState): Boolean = state in LOCATION_REQUIRED_STATES
+
+    /**
+     * Routes an intent that arrived while initialization was still in progress, including one
+     * that landed during the final delay, then moves to [OnboardingState.COMPLETE].
+     * The pending flag is consumed here so a later intent handled in COMPLETE is not replayed.
+     */
+    fun finishInitialization(
+        state: OnboardingState,
+        consumePendingIntent: () -> Boolean,
+        routePendingIntent: () -> Unit
+    ): OnboardingState {
+        if (state != OnboardingState.INITIALIZING) return state
+        if (consumePendingIntent()) routePendingIntent()
+        return OnboardingState.COMPLETE
+    }
 }
 
 /**

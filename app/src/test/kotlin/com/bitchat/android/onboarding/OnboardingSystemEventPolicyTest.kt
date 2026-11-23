@@ -128,4 +128,37 @@ class OnboardingSystemEventPolicyTest {
         assertEquals(0, errors)
         assertEquals(OnboardingState.COMPLETE, state)
     }
+
+    @Test
+    fun `intent arriving between transport startup and complete is routed once`() {
+        var pending = false
+        var routed = 0
+        val consume = {
+            val marked = pending
+            pending = false
+            marked
+        }
+        val route = { routed++ }
+
+        // onNewIntent during the final delay only marks the intent pending.
+        pending = true
+        val completed = OnboardingSystemEventPolicy.finishInitialization(
+            OnboardingState.INITIALIZING,
+            consume,
+            route
+        )
+
+        assertEquals(OnboardingState.COMPLETE, completed)
+        assertEquals(1, routed)
+        assertFalse(pending)
+
+        // A later intent handled in COMPLETE must not replay the one just drained.
+        val stayed = OnboardingSystemEventPolicy.finishInitialization(
+            OnboardingState.COMPLETE,
+            consume,
+            route
+        )
+        assertEquals(OnboardingState.COMPLETE, stayed)
+        assertEquals(1, routed)
+    }
 }
