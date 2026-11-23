@@ -30,6 +30,8 @@ class BluetoothConnectionTracker(
     private val connectedDevices = ConcurrentHashMap<String, DeviceConnection>()
     private val subscribedDevices = CopyOnWriteArrayList<BluetoothDevice>()
     val addressPeerMap = ConcurrentHashMap<String, String>()
+    /** GATT identity bytes seen on a link before Noise has authenticated that peer. */
+    private val pendingDeclaredIdentity = ConcurrentHashMap<String, String>()
     // RSSI tracking from scan results (for devices we discover but may connect as servers)
     private val scanRSSI = ConcurrentHashMap<String, Int>()
     
@@ -168,7 +170,39 @@ class BluetoothConnectionTracker(
     }
 
     /**
-     * Update device peer ID binding
+     * Remember a declared GATT identity without publishing it for routing or dedup.
+     * Returns false when the value is not exactly eight bytes (sixteen hex chars).
+     */
+    fun noteDeclaredIdentity(deviceAddress: String, peerID: String): Boolean {
+        if (peerID.length != 16 || peerID.any { it !in '0'..'9' && it !in 'a'..'f' }) {
+            return false
+        }
+        pendingDeclaredIdentity[deviceAddress] = peerID
+        Log.d(TAG, "Stored unauthenticated identity for $deviceAddress")
+        return true
+    }
+
+    /**
+     * Bind [authenticatedPeerID] to [deviceAddress] after Noise has authenticated it.
+     * A conflicting declaration is ignored. If another link already owns this peer,
+     * the existing route is left in place and this call returns false.
+     */
+    fun bindAuthenticatedPeer(deviceAddress: String, authenticatedPeerID: String): Boolean {
+        val declared = pendingDeclaredIdentity.remove(deviceAddress)
+        if (declared != null && declared != authenticatedPeerID) {
+            Log.w(TAG, "Ignoring declared identity $declared; Noise authenticated $authenticatedPeerID on $deviceAddress")
+        }
+        val existing = addressPeerMap.entries.firstOrNull { it.value == authenticatedPeerID && it.key != deviceAddress }
+        if (existing != null) {
+            Log.w(TAG, "Peer $authenticatedPeerID already routed via ${existing.key}; not rebinding $deviceAddress")
+            return false
+        }
+        setDevicePeerID(deviceAddress, authenticatedPeerID)
+        return addressPeerMap[deviceAddress] == authenticatedPeerID
+    }
+
+    /**
+     * Update device peer ID binding. Call only after the peer is authenticated.
      */
     fun setDevicePeerID(deviceAddress: String, peerID: String) {
         connectedDevices[deviceAddress]?.let { deviceConn ->
@@ -310,6 +344,7 @@ class BluetoothConnectionTracker(
      * Clean up a specific device connection
      */
     fun cleanupDeviceConnection(deviceAddress: String) {
+        pendingDeclaredIdentity.remove(deviceAddress)
         connectedDevices.remove(deviceAddress)?.let { deviceConn ->
             subscribedDevices.removeAll { it.address == deviceAddress }
             addressPeerMap.remove(deviceAddress)

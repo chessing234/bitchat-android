@@ -235,38 +235,27 @@ class BluetoothGattServerManager(
                         gattServer?.sendResponse(device, requestId, BluetoothGatt.GATT_SUCCESS, 0, null)
                     }
                 } else if (characteristic.uuid == AppConstants.Mesh.Gatt.IDENTITY_CHARACTERISTIC_UUID) {
-                    val peerID = value.joinToString("") { "%02x".format(it) }
-                    Log.i(TAG, "Server: Received Identity signal from ${device.address}: $peerID")
-                    
-                    if (value.size >= 8) {
-                        // 1. Update tracker with the declared identity
-                        connectionTracker.setDevicePeerID(device.address, peerID)
-                        
-                        // 2. Check for duplicates (same peerID, different MAC)
-                        // Note: If we just set it above, we look for *others*
-                        val duplicate = connectionTracker.getConnectedDevices().values.firstOrNull { 
-                            it.peerID == peerID && it.device.address != device.address 
+                    // Prepared or offset writes are not a complete identity. Reject them
+                    // before any connection state changes.
+                    if (preparedWrite || offset != 0) {
+                        Log.w(TAG, "Server: Rejecting partial identity write from ${device.address} (prepared=$preparedWrite offset=$offset)")
+                        if (responseNeeded) {
+                            val status = if (offset != 0) BluetoothGatt.GATT_INVALID_OFFSET else BluetoothGatt.GATT_REQUEST_NOT_SUPPORTED
+                            gattServer?.sendResponse(device, requestId, status, offset, null)
                         }
-                        
-                        if (duplicate != null) {
-                            Log.w(TAG, "Server: Deduplication - Peer $peerID is already connected via ${duplicate.device.address}. Rejecting new connection ${device.address}.")
-                            
-                            // Send success response first to be polite before killing the connection?
-                            // Or fail it?
-                            if (responseNeeded) {
-                                gattServer?.sendResponse(device, requestId, BluetoothGatt.GATT_SUCCESS, 0, null)
-                            }
-                            
-                            // Disconnect the NEW connection (this one)
-                            disconnectDevice(device)
-                            return
-                        } else {
-                            Log.d(TAG, "Server: Identity accepted for $peerID at ${device.address}")
-                        }
-                    } else {
-                        Log.w(TAG, "Server: Invalid Identity length from ${device.address}: ${value.size}")
+                        return
                     }
-
+                    if (value.size != 8) {
+                        Log.w(TAG, "Server: Rejecting identity length ${value.size} from ${device.address}")
+                        if (responseNeeded) {
+                            gattServer?.sendResponse(device, requestId, BluetoothGatt.GATT_INVALID_ATTRIBUTE_LENGTH, 0, null)
+                        }
+                        return
+                    }
+                    val peerID = value.joinToString("") { "%02x".format(it) }
+                    Log.i(TAG, "Server: Queued unauthenticated identity from ${device.address}: $peerID")
+                    // Routing and dedup wait until Noise authenticates this link.
+                    connectionTracker.noteDeclaredIdentity(device.address, peerID)
                     if (responseNeeded) {
                         gattServer?.sendResponse(device, requestId, BluetoothGatt.GATT_SUCCESS, 0, null)
                     }

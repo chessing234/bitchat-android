@@ -28,7 +28,7 @@ class BluetoothGattClientManager(
     private val permissionManager: BluetoothPermissionManager,
     private val powerManager: PowerManager,
     private val delegate: BluetoothConnectionManagerDelegate?,
-    private val myPeerID: String
+    private val myPeerID: String = "0000000000000000"
 ) {
     
     companion object {
@@ -330,11 +330,9 @@ class BluetoothGattClientManager(
         }
 
         if (peerID != null) {
-            // Log.v(TAG, "Found peerID $peerID in scan record for $deviceAddress")
-            if (connectionTracker.isPeerConnected(peerID)) {
-                 Log.d(TAG, "Deduplication: Peer $peerID is already connected (ignoring $deviceAddress)")
-                 return
-            }
+            // Scan service data is not authenticated. Keep it off the routing map until Noise
+            // binds this link; a declared id must not drop or replace an existing connection.
+            connectionTracker.noteDeclaredIdentity(deviceAddress, peerID.take(16))
         }
 
         // Log.d(TAG, "Received scan result from $deviceAddress - already connected: ${connectionTracker.isDeviceConnected(deviceAddress)}")
@@ -457,7 +455,7 @@ class BluetoothGattClientManager(
                         gatt = gatt,
                         rssi = rssi,
                         isClient = true,
-                        peerID = peerID // Store the peerID discovered during scan
+                        peerID = null // Authenticated binding happens after Noise
                     )
                     connectionTracker.addDeviceConnection(deviceAddress, deviceConn)
                     

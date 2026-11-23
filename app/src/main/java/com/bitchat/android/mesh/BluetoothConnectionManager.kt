@@ -350,6 +350,18 @@ class BluetoothConnectionManager(
     fun connectToAddress(address: String): Boolean = clientManager.connectToAddress(address)
     fun disconnectAddress(address: String) { connectionTracker.disconnectDevice(address) }
 
+    /**
+     * Publish a route for [peerID] on [deviceAddress] only after Noise has authenticated it.
+     * Keeps the existing route when that peer is already bound elsewhere.
+     */
+    fun bindAuthenticatedPeer(deviceAddress: String, peerID: String): Boolean {
+        val bound = connectionTracker.bindAuthenticatedPeer(deviceAddress, peerID)
+        if (!bound) {
+            disconnectAddress(deviceAddress)
+        }
+        return bound
+    }
+
 
     // Optionally disconnect all connections (server and client)
     fun disconnectAll() {

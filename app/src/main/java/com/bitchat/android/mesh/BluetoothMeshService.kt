@@ -464,7 +464,15 @@ class BluetoothMeshService(private val context: Context) {
             }
             
             override fun handleNoiseHandshake(routed: RoutedPacket): Boolean {
-                return runBlocking { securityManager.handleNoiseHandshake(routed) }
+                val accepted = runBlocking { securityManager.handleNoiseHandshake(routed) }
+                val peerID = routed.peerID
+                val deviceAddress = routed.relayAddress
+                if (accepted && peerID != null && deviceAddress != null &&
+                    encryptionService.hasEstablishedSession(peerID)
+                ) {
+                    connectionManager.bindAuthenticatedPeer(deviceAddress, peerID)
+                }
+                return accepted
             }
             
             override fun handleNoiseEncrypted(routed: RoutedPacket) {
